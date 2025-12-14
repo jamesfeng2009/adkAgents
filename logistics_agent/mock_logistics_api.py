@@ -218,7 +218,7 @@ class MockLogisticsApi:
     ) -> Dict[str, Any]:
         """创建预报订单，检查必需字段"""
         
-        # 检查必需字段
+        # 检查必需字段（基础字段）
         required_fields = [
             "customernumber1",      # 客户参考号
             "countrycode",          # 收件国家代码 (对应consignee_countrycode)
@@ -229,12 +229,15 @@ class MockLogisticsApi:
             "consigneeprovince",    # 收件省州
             "declaretypepkid",      # 报关类型ID
             "producttypepkid",      # 产品类型ID  
+            "forecastweight",       # 预估重量
+            "number"                # 数量
+        ]
+        
+        # 保险相关字段（条件必需）
+        insurance_fields = [
             "insurancevalue",       # 保险价值
             "insurancetypepkid",    # 保险类型ID
             "insurancecurrency",    # 保险币别
-            "isinsurance",          # 是否投保
-            "forecastweight",       # 预估重量
-            "number"                # 数量
         ]
         
         missing_fields = []
@@ -246,10 +249,17 @@ class MockLogisticsApi:
             if isinstance(datas, list) and datas:
                 order_data = datas[0].get("order", {}) if isinstance(datas[0], dict) else {}
         
-        # 检查缺失字段
+        # 检查基础必需字段
         for field in required_fields:
             if field not in order_data or order_data[field] is None or order_data[field] == "":
                 missing_fields.append(field)
+        
+        # 检查保险相关字段（如果启用了保险）
+        is_insurance = order_data.get("isinsurance")
+        if is_insurance == "1" or is_insurance == 1:
+            for field in insurance_fields:
+                if field not in order_data or order_data[field] is None or order_data[field] == "":
+                    missing_fields.append(field)
         
         # 如果有缺失字段，返回错误响应
         if missing_fields:
@@ -334,12 +344,20 @@ class MockLogisticsApi:
         }
 
     def track(self, *, waybillnumber: str) -> Dict[str, Any]:
-        """Mock track API - 查询轨迹接口"""
+        """Mock track API - 查询轨迹接口
+        
+        支持通过以下方式查询：
+        1. 运单号 (waybillnumber)
+        2. 订单号 (systemnumber) 
+        3. 客户参考号 (customernumber)
+        """
         if not waybillnumber or waybillnumber.strip() == "":
             return {"msg": "success", "code": 0, "data": []}
 
+        search_number = waybillnumber.strip()
+        
         # 特殊处理订单号 #12345 (演示用例)
-        if waybillnumber in {"12345", "#12345"}:
+        if search_number in {"12345", "#12345"}:
             systemnumber = f"SYS{_stable_id('12345')}"
             tracknumber = f"1Z{_stable_id('12345', 'track').upper()}"
 
@@ -384,43 +402,19 @@ class MockLogisticsApi:
                 ],
             }
 
-        # 检查是否是已创建的订单
+        # 检查是否是已创建的订单 - 支持多种查询方式
         for customernumber, record in self._orders_by_customernumber.items():
-            if record.get("waybillnumber") == waybillnumber:
-                # 模拟真实的轨迹信息
-                return {
-                    "msg": "success", 
-                    "code": 0,
-                    "data": [
-                        {
-                            "searchNumber": waybillnumber,
-                            "systemnumber": record.get("systemnumber"),
-                            "waybillnumber": waybillnumber,
-                            "tracknumber": record.get("childs", [{}])[0].get("tracknumber", ""),
-                            "countrycode": "US",
-                            "orderstatus": "InTransit",
-                            "orderstatusName": "运输中",
-                            "trackItems": [
-                                {
-                                    "location": "Shenzhen, CN",
-                                    "trackdate_utc8": f"{_now_str()}",
-                                    "trackdate": f"{_now_str()}",
-                                    "info": "已揽收",
-                                    "responsecode": "OT001",
-                                },
-                                {
-                                    "location": "Processing Center",
-                                    "trackdate_utc8": f"{_now_str()}",
-                                    "trackdate": f"{_now_str()}",
-                                    "info": "运输中",
-                                    "responsecode": "OT002",
-                                },
-                            ],
-                            "subOrderList": record.get("childs", []),
-                            "subOrderTrackItems": {},
-                        }
-                    ],
-                }
+            # 1. 通过运单号查询
+            if record.get("waybillnumber") == search_number:
+                return self._build_track_response(record, search_number)
+            
+            # 2. 通过订单号（systemnumber）查询
+            if str(record.get("systemnumber")) == search_number:
+                return self._build_track_response(record, search_number)
+            
+            # 3. 通过客户参考号查询
+            if record.get("customernumber") == search_number:
+                return self._build_track_response(record, search_number)
 
         # 无效单号
         return {
@@ -428,9 +422,45 @@ class MockLogisticsApi:
             "code": 0,
             "data": [
                 {
-                    "waybillnumber": waybillnumber,
-                    "searchNumber": waybillnumber,
+                    "waybillnumber": search_number,
+                    "searchNumber": search_number,
                     "errormsg": "无效的单号",
+                }
+            ],
+        }
+
+    def _build_track_response(self, record: dict, search_number: str) -> Dict[str, Any]:
+        """构建轨迹查询响应"""
+        return {
+            "msg": "success", 
+            "code": 0,
+            "data": [
+                {
+                    "searchNumber": search_number,
+                    "systemnumber": record.get("systemnumber"),
+                    "waybillnumber": record.get("waybillnumber"),
+                    "tracknumber": record.get("childs", [{}])[0].get("tracknumber", ""),
+                    "countrycode": "US",
+                    "orderstatus": "InTransit",
+                    "orderstatusName": "运输中",
+                    "trackItems": [
+                        {
+                            "location": "Shenzhen, CN",
+                            "trackdate_utc8": f"{_now_str()}",
+                            "trackdate": f"{_now_str()}",
+                            "info": "已揽收",
+                            "responsecode": "OT001",
+                        },
+                        {
+                            "location": "Processing Center",
+                            "trackdate_utc8": f"{_now_str()}",
+                            "trackdate": f"{_now_str()}",
+                            "info": "运输中",
+                            "responsecode": "OT002",
+                        },
+                    ],
+                    "subOrderList": record.get("childs", []),
+                    "subOrderTrackItems": {},
                 }
             ],
         }

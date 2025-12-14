@@ -178,10 +178,22 @@ def _extract_partial_order_fields(text: str) -> dict[str, Any]:
 
     out: dict[str, Any] = {}
 
-    m = re.search(r"从\s*([^\s，,；;\n]+)\s*到\s*([^\s，,；;\n]+)", t)
-    if m:
-        out["origin_city"] = m.group(1).strip()
-        out["destination_city"] = m.group(2).strip()
+    # 改进的城市提取逻辑，支持更多格式
+    city_patterns = [
+        # 标准格式：从深圳到洛杉矶；
+        r"从\s*([^\s，,；;\n的]+)\s*到\s*([^\s，,；;\n的]+)\s*[；;，,。]",
+        # 自然语言格式：从深圳到洛杉矶的物流订单
+        r"从\s*([^\s，,；;\n的]+)\s*到\s*([^\s，,；;\n的]+)\s*的",
+        # 简单格式：从深圳到洛杉矶
+        r"从\s*([^\s，,；;\n的]+)\s*到\s*([^\s，,；;\n的]+)",
+    ]
+    
+    for pattern in city_patterns:
+        m = re.search(pattern, t)
+        if m:
+            out["origin_city"] = m.group(1).strip()
+            out["destination_city"] = m.group(2).strip()
+            break
 
     customernumber1 = _find([
         r"customernumber1\s*[:：=]\s*([^\s，,；;\n]+)",
@@ -293,6 +305,8 @@ def _extract_partial_order_fields(text: str) -> dict[str, Any]:
     declare_type_name = _find([
         r"报关类型\s*[:：=]\s*([^\n，,；;]+)",
         r"declare_type_name\s*[:：=]\s*([^\n，,；;]+)",
+        r"报关\s*[:：=]\s*[^=]*类型\s*[:：=]\s*([^\n，,；;]+)",  # 匹配 "报关=按关类型=需要报关" 这种格式
+        r"报关\s*[:：=]\s*([^\n，,；;]+)",  # 匹配简单的 "报关=需要报关"
     ])
     if declare_type_name:
         canon = declare_type_name.strip()
@@ -301,8 +315,8 @@ def _extract_partial_order_fields(text: str) -> dict[str, Any]:
         if "不需要报关" in canon_norm or canon_norm in {"不需报关", "无需报关", "免报关"}:
             canon = "不需报关"
         elif "需要报关" in canon_norm or "要报关" in canon_norm or "报关" == canon_norm:
-            # Default to a common customs mode when user only says they need customs.
-            canon = "买单报关"
+            # When user only says they need customs, mark it as ambiguous for later handling
+            canon = "需要报关_请选择具体类型"
         out["declare_type_name"] = canon
 
     return out
@@ -330,6 +344,18 @@ def _pick_by_name_or_default(
         if not options:
             raise ValueError(f"No options available for {label}")
         return options[0]
+    
+    # Special handling for ambiguous declare type selection
+    if name == "需要报关_请选择具体类型" and label == "declaretype":
+        # Find customs options (excluding "不需报关")
+        customs_options = [opt for opt in options if opt.get("name") != "不需报关"]
+        if customs_options:
+            option_names = [opt.get("name") for opt in customs_options]
+            raise ValueError(
+                f"报关类型(declaretype) 必须从以下选项中选择：{', '.join([opt.get('name') for opt in options])}。"
+                f"您输入的 '需要报关' 过于模糊，请选择具体类型：{', '.join(option_names)}。"
+            )
+    
     needle = _normalize_text(name)
 
     exact_matches: list[dict] = []
@@ -366,7 +392,27 @@ def _pick_by_name_or_default(
             f"Ambiguous {label} name: {name}. Candidates: {[m.get('name') or m.get('cnname') or m.get('enname') for m in contains_matches]}"
         )
 
-    raise ValueError(f"Invalid {label} name: {name}")
+    # Enhanced error message with available options for better user experience
+    if label == "declaretype":
+        available_options = [opt.get("name") for opt in options if opt.get("name")]
+        raise ValueError(
+            f"报关类型(declaretype) 必须从以下选项中选择：{', '.join(available_options)}。"
+            f"您输入的 '{name}' 无法识别，请使用准确的选项名称。"
+        )
+    elif label == "producttype":
+        available_options = [opt.get("cnname") or opt.get("enname") or opt.get("name") for opt in options if opt.get("cnname") or opt.get("enname") or opt.get("name")]
+        raise ValueError(
+            f"产品类型(producttype) 必须从以下选项中选择：{', '.join(available_options)}。"
+            f"您输入的 '{name}' 无法识别，请使用准确的选项名称。"
+        )
+    elif label == "insurance":
+        available_options = [opt.get("name") for opt in options if opt.get("name")]
+        raise ValueError(
+            f"保险类型(insurance) 必须从以下选项中选择：{', '.join(available_options)}。"
+            f"您输入的 '{name}' 无法识别，请使用准确的选项名称。"
+        )
+    else:
+        raise ValueError(f"Invalid {label} name: {name}. Available options: {[opt.get('name') or opt.get('cnname') or opt.get('enname') for opt in options]}")
 
 
 def get_insurance_types() -> dict:
@@ -680,6 +726,9 @@ def create_forecast_order_with_preferences(
         resp = _ok(request_payload=request_payload, result=result, **extras)
         _save_last_order_from_response(resp)
         return resp
+    except ValueError as e:
+        # Preserve detailed validation error messages (like declare type options)
+        return _err(str(e))
     except Exception as e:
         return _err("failed to create forecast order", reason=str(e))
 
@@ -977,20 +1026,15 @@ def debug_runtime_info() -> dict:
 
 
 def query_order_status(order_no: str) -> dict:
-    """查询物流状态（按文档 Track 接口结构 mock 返回）。"""
+    """查询物流状态 - 支持运单号、订单号、客户参考号等多种查询方式"""
     normalized = order_no.strip()
     if normalized.startswith("#"):
         normalized = normalized[1:]
-    # The mocked track API expects a waybillnumber.
-    # Users may paste a systemnumber (e.g. SYSxxxx). If it matches the last order,
-    # map it to the last waybillnumber for convenience.
-    if normalized.startswith("SYS") and _LAST_ORDER:
-        last_system = _LAST_ORDER.get("systemnumber")
-        last_waybill = _LAST_ORDER.get("waybillnumber")
-        if last_system and str(last_system) == normalized and last_waybill:
-            normalized = str(last_waybill)
-
+    
+    # 直接使用输入的订单号进行查询，mock API 现在支持多种查询方式
     resp = _tool_call(_api.track, tool_name="query_order_status", waybillnumber=normalized)
+    
+    # 检查是否查询成功
     try:
         raw = resp.get("data", {}).get("raw") if isinstance(resp, dict) else None
         if isinstance(raw, dict):
@@ -998,14 +1042,44 @@ def query_order_status(order_no: str) -> dict:
             if isinstance(data, list) and data:
                 first = data[0]
                 if isinstance(first, dict) and first.get("errormsg"):
+                    # 如果查询失败，提供更友好的错误信息
                     return _err(
-                        "invalid order number",
+                        "订单号未找到",
                         input=order_no,
-                        hint="track expects waybillnumber; if you only have systemnumber, call get_last_order_reference or query_last_order_status",
+                        hint="请检查订单号是否正确。支持查询：运单号、订单号(systemnumber)、客户参考号",
+                        suggestions=[
+                            "如果是刚创建的订单，可以使用 query_last_order_status 查询最近订单",
+                            "如果有客户参考号，可以使用 get_waybillnumbers 获取运单号后再查询"
+                        ],
                         raw=raw,
                     )
+                else:
+                    # 查询成功，添加查询类型信息
+                    search_number = first.get("searchNumber", normalized)
+                    systemnumber = first.get("systemnumber")
+                    waybillnumber = first.get("waybillnumber")
+                    
+                    # 判断查询类型
+                    query_type = "未知"
+                    if search_number == waybillnumber:
+                        query_type = "运单号"
+                    elif search_number == str(systemnumber):
+                        query_type = "订单号"
+                    else:
+                        query_type = "客户参考号"
+                    
+                    # 在响应中添加查询信息
+                    if isinstance(resp.get("data"), dict):
+                        resp["data"]["query_info"] = {
+                            "input": order_no,
+                            "search_number": search_number,
+                            "query_type": query_type,
+                            "systemnumber": systemnumber,
+                            "waybillnumber": waybillnumber
+                        }
     except Exception:
         pass
+    
     return resp
 
 
@@ -1029,15 +1103,27 @@ root_agent = Agent(
     description="An agent that can query logistics tracking and create shipments via a mocked logistics API.",
     instruction=(
         "You are a logistics assistant. "
+        "CRITICAL TOOL SELECTION RULES: "
+        "1. When user provides Chinese text with order details (containing 从...到... or order fields), ALWAYS use submit_forecast_order_from_text FIRST. "
+        "2. When user provides JSON string, use submit_forecast_order_json. "
+        "3. NEVER use create_forecast_order_with_preferences unless user explicitly provides individual parameters. "
+        "4. If submit_forecast_order_from_text fails due to missing fields, then ask for those specific fields. "
         "Before creating an order, you can fetch lookup values using get_insurance_types, get_currencies, get_declare_types, get_customs_types, get_terms_of_sale, get_export_reasons, and get_product_types. "
         "You can also build a complete createForecast payload using build_create_forecast_payload. "
         "All tools return a unified structure: {status, data, error}. The original mocked API response, if any, is available under data.raw. "
         "When creating an order, if the user does not specify channelid/forecastweight/number, use defaults (channelid=HK_TNT, forecastweight=1.0, number=1) and proceed; only ask for missing fields that are truly required (consignee fields and customernumber1). "
         "For order creation, prefer submit_forecast_order_json when the user provides JSON; it is the most reliable way to pass structured input. "
         "When calling submit_forecast_order_json, you MUST pass the user's JSON VERBATIM as the order_json argument (do not rewrite, truncate, or replace it with {}). "
-        "When the user provides natural language order details, prefer submit_forecast_order_from_text and you MUST pass the user's message VERBATIM as the text argument (do not summarize, translate, truncate, or drop lines). "
+        "When the user provides natural language order details (especially Chinese text with 从...到... pattern), ALWAYS use submit_forecast_order_from_text FIRST and you MUST pass the user's message VERBATIM as the text argument (do not summarize, translate, truncate, or drop lines). "
+        "After successful order creation, IMMEDIATELY extract and display both order_id and tracking_id from the tool response. "
         "If the user explicitly asks to call a specific tool (e.g. contains '请调用 <tool_name>' or 'call <tool_name>'), you MUST call that exact tool once. "
-        "When returning tool output, output the returned dict as plain JSON text ONLY (no prose, no markdown, no ```json fences, no extra wrapper keys). "
+        "CRITICAL ORDER DISPLAY RULES: "
+        "When an order is successfully created, you MUST ALWAYS display BOTH the order number AND tracking number clearly in your response: "
+        "- Order Number (订单号/系统单号): Use data.order_id or result.data[0].systemnumber "
+        "- Tracking Number (运单号): Use data.tracking_id or result.data[0].waybillnumber "
+        "- Customer Number (客户单号): Use result.data[0].customernumber "
+        "NEVER display only the tracking number without the order number. Both numbers are essential for the user. "
+        "ALWAYS include both numbers in your success message, for example: 'Order created successfully! Order Number: 12345, Tracking Number: EV67890CN' "
         "For step-by-step input, use update_forecast_order_draft to accumulate fields and ask for missing_fields from its JSON result; when ready, call submit_forecast_order_draft (or update_forecast_order_draft with auto_submit=true). "
         "If the user doesn't have an order number, use get_last_order_reference to fetch the latest identifiers, or query_last_order_status to query tracking for the latest order. "
         "If waybillnumber is empty in the createForecast result, call get_waybillnumbers with customernumber to retrieve waybillnumber. "
@@ -1046,7 +1132,6 @@ root_agent = Agent(
         "If the user asks for raw JSON or says 'do not summarize', output ONLY the tool JSON as-is (no extra text, no markdown fences, no additional keys), including when status=error. "
         "Use query_order_status to query tracking/status for an order number. "
         "Use create_shipment to create a new shipment. "
-        "Return the tool output as-is."
     ),
     tools=[
         get_insurance_types,
